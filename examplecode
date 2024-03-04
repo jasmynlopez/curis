@@ -1,0 +1,167 @@
+/**
+ * File: stsh.cc
+ * -------------
+ * Defines the entry point of the stsh executable.
+ */
+#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>   // for fork
+#include <sys/wait.h> // for waitpid
+#include "stsh-parser/stsh-parse.h"
+#include "stsh-parser/stsh-readline.h"
+#include "stsh-exception.h"
+#include "fork-utils.h" // this needs to be the last #include in the list
+using namespace std;
+
+/* Function: input_redirect
+ * ------------------------
+ * This function redirects input as needed
+ */
+void input_redirect(const pipeline& p) {
+    if (p.input != "") {  
+        int fd = open(p.input.c_str(), O_RDONLY, 0644); // open file to read only
+        if (fd == -1) {  // if there was an error opening the file throw STSHException
+            throw STSHException("Could not open \"" + p.input + "\"."); 
+        }
+        dup2(fd, STDIN_FILENO);  // redirect input to be the file we opened
+        close(fd);
+    }
+}
+/* Function: output_redirect 
+ * -------------------------
+ * This function redirects output as needed 
+ */
+void output_redirect(const pipeline& p) {
+    if (p.output != "") {  
+        int fd = open(p.output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);  // open file to write only
+        if (fd == -1) {  // if there was an error opening the file throw STSHException
+            throw STSHException("Could not open '" + p.output + "'"); 
+        }
+        dup2(fd, STDOUT_FILENO);  // redirect output to go to the file we opened
+        close(fd);
+    }
+}
+/* Function: error_check
+ * ---------------------
+ * Helper function that takes in one parameter, 
+ * the pid(or -1) of a child to wait on. This 
+ * function reports segmentation faults and helped 
+ * me unify the same chunk of code that was in my 
+ * single and multi process functions. 
+ */
+void error_check(pid_t pid_or_negone) {
+    int status; 
+    waitpid(pid_or_negone, &status, 0);  // wait for a child or -1 for any child
+    if (WIFSIGNALED(status)) {
+        if (WTERMSIG(status) == SIGSEGV) {
+            cerr << "Segmentation fault" << endl;  // If segfault print segfault error message
+        }
+    }
+}
+/* Function: multi_process 
+ * ----------------------
+ * Handles 2+ process, supports input/output redirection
+ */
+void multi_process(const pipeline& p) {
+    int num_commands = (p.commands).size();  // get number of commands
+    int num_pipes = num_commands - 1;  // num pipes is one less than number of commands
+    int fds[num_pipes * 2];  // multiply by 2 because read/write end for each pipe
+    // Create all pipes before any forks
+    for (int i = 0; i < num_pipes * 2; i += 2){
+        pipe2(fds + i, O_CLOEXEC);
+    }
+    // First command edge case
+    pid_t child_1 = fork();
+    if (child_1 == 0) {  // if we are child 1
+        command first_cmd = p.commands[0];
+        dup2(fds[1], STDOUT_FILENO);  // Rewire output to go to write end of first pipe
+        input_redirect(p); 
+        execvp(first_cmd.argv[0], first_cmd.argv);
+    }  
+    // Loop over the middle cases to repeat wiring process
+    for(int i = 1; i < num_commands - 1; i ++) {  
+        pid_t ith_child = fork();  // fork to spawn child process
+        if (ith_child == 0) {  // If we are the child process then
+            command curr_command = p.commands[i];
+            dup2(fds[(i * 2) - 2], STDIN_FILENO);  // Read input from read end of pipe between process i and i - 1
+            dup2(fds[(i * 2) + 1], STDOUT_FILENO);  // Rewire output to write end of pipe between process i and i + 1
+            execvp(curr_command.argv[0], curr_command.argv);
+        }
+    }
+    
+    // Last command edge case
+    pid_t last_child = fork();  // fork a final child process
+  
+    // Close all write ends because parent doesn't need them and last child does not write to any pipes
+    for (int i = 0; i < num_commands; i ++) {  
+        close(fds[(i * 2) + 1]);
+    }
+    
+    if (last_child == 0) {  // if we are the last child process
+        command last_cmd = p.commands[num_commands - 1];
+        dup2(fds[(num_pipes * 2) - 2], STDIN_FILENO);  // Read input from pipe between last and second to last commands
+        output_redirect(p); 
+        execvp(last_cmd.argv[0], last_cmd.argv);
+    }  // only parent should get here
+    
+    
+    // parent needs to close all of the read ends of the pipe that are open
+    for (int i = 1; i < num_commands; i ++ ) {
+        close(fds[(i * 2) - 2]);
+    }
+    
+    // wait PID and error check on all children but in any order (send -1)
+    pid_t either = -1;
+    for (int i = 0; i < num_commands; i ++) {
+        error_check(either);
+    } 
+} 
+/* Function: single_process 
+ * -----------------------
+ * Handles 1 process, supports input/output redirection 
+ */
+void single_process(const pipeline& p) { 
+    command cmd = p.commands[0];
+    pid_t pidOrZero = fork();
+    if (pidOrZero == 0) {  // if we are the child
+        input_redirect(p);
+        output_redirect(p);
+        execvp(cmd.argv[0], cmd.argv);  
+        // execvp does not return in this function, if child gets here there is an error
+        throw STSHException(string(cmd.argv[0]) + ": Command not found."); 
+    }
+    error_check(pidOrZero); 
+}
+/**
+ * Create new process(es) for the provided pipeline. Spawns child processes with
+ * input/output redirected to the appropriate pipes and/or files.
+ */
+void runPipeline(const pipeline& p) {
+    if ((p.commands).size() == 1) { 
+        single_process(p);
+    } else {
+        multi_process(p); 
+    }
+   
+}
+/**
+ * Define the entry point for a process running stsh.
+ */
+int main(int argc, char *argv[]) {
+  pid_t stshpid = getpid();
+  rlinit(argc, argv);
+  while (true) {
+    string line;
+    if (!readline(line) || line == "quit" || line == "exit") break;
+    if (line.empty()) continue;
+    try {
+      pipeline p(line);
+      runPipeline(p);
+    } catch (const STSHException& e) {
+      cerr << e.what() << endl;
+      if (getpid() != stshpid) exit(0); // if exception is thrown from child process, kill it
+    }
+  }
+  return 0;
+}
+
